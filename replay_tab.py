@@ -45,8 +45,60 @@ class ReplayTab(QWidget):
     def _parse_osr(self, path):
         try:
             with open(path, "rb") as f:
-                mode = struct.unpack("<B", f.read(1))[0]
-                self.info_view.setPlainText(f"Replay File:\nGame Mode Context ID: {mode}\nFile Size Array: {os.path.getsize(path)} bytes")
-                self.log_signal.emit(f"Processed isolated file parameters for: {os.path.basename(path)}")
+                mode_id = struct.unpack("<B", f.read(1))[0]
+                modes = {0: "osu!", 1: "Taiko", 2: "Catch the Beat", 3: "osu!mania"}
+                mode_str = modes.get(mode_id, f"Unknown ({mode_id})")
+
+                version = struct.unpack("<I", f.read(4))[0]
+
+                def read_osu_string(file_obj):
+                    indicator = file_obj.read(1)
+                    if not indicator or indicator == b'\x00':
+                        return ""
+                    if indicator == b'\x0b':
+                        length = 0
+                        shift = 0
+                        while True:
+                            b = file_obj.read(1)[0]
+                            length |= (b & 0x7F) << shift
+                            if not (b & 0x80):
+                                break
+                            shift += 7
+                        return file_obj.read(length).decode('utf-8', errors='ignore')
+                    return ""
+
+                beatmap_hash = read_osu_string(f)
+                player_name = read_osu_string(f)
+                replay_hash = read_osu_string(f)
+
+                # The actual fix: The struct needs exactly 23 bytes, not 30.
+                stats_bytes = f.read(23)
+                
+                if len(stats_bytes) == 23:
+                    count_300, count_100, count_50, gekis, katus, misses, score, max_combo, perfect, mods_bitmask = struct.unpack(
+                        "<HHHHHHIHBI", stats_bytes
+                    )
+                else:
+                    count_300 = count_100 = count_50 = gekis = katus = misses = score = max_combo = perfect = mods_bitmask = "N/A"
+
+                metadata_text = (
+                    f"File: {os.path.basename(path)}\n"
+                    f"Size: {os.path.getsize(path):,} bytes\n"
+                    f"----------------------------------------\n"
+                    f"Game Mode: {mode_str}\n"
+                    f"Game Version: {version}\n"
+                    f"Player Name: {player_name if player_name else 'Unknown'}\n"
+                    f"Score: {score if isinstance(score, str) else f'{score:,}'}\n"
+                    f"Max Combo: {max_combo}x\n"
+                    f"300s / 100s / 50s: {count_300} / {count_100} / {count_50}\n"
+                    f"Misses: {misses}\n"
+                    f"Beatmap MD5: {beatmap_hash if beatmap_hash else 'N/A'}\n"
+                    f"Replay MD5: {replay_hash if replay_hash else 'N/A'}\n"
+                )
+                    
+                self.info_view.setPlainText(metadata_text)
+                self.log_signal.emit(f"[INFO] Successfully processed metadata for: {os.path.basename(path)}")
+
         except Exception as e:
             self.info_view.setPlainText(f"Parsing Error: {e}")
+            self.log_signal.emit(f"[ERROR] Binary parsing failed on target replay file: {e}")

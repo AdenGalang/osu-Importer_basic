@@ -14,7 +14,9 @@ from PyQt5.QtGui import QFont, QTextCursor
 from replay_tab import ReplayTab
 from game_data_tab import GameDataTab
 
-CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".osu_downloader_config.json")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(_BASE_DIR, "osu_downloader_config.json")
+INDEXED_IDS_FILE = os.path.join(_BASE_DIR, "indexed_beatmaps.txt")
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -25,7 +27,21 @@ def load_config():
 
 def save_config(data):
     try:
-        with open(CONFIG_FILE, "w") as f: json.dump(data, f)
+        with open(CONFIG_FILE, "w") as f: json.dump(data, f, indent=2)
+    except: pass
+
+def load_indexed_ids():
+    if os.path.exists(INDEXED_IDS_FILE):
+        try:
+            with open(INDEXED_IDS_FILE) as f:
+                return set(line.strip() for line in f if line.strip().isdigit())
+        except: pass
+    return set()
+
+def save_indexed_ids(ids):
+    try:
+        with open(INDEXED_IDS_FILE, "w") as f:
+            f.write("\n".join(sorted(ids, key=lambda x: int(x))))
     except: pass
 
 class DownloadWorker(QThread):
@@ -121,8 +137,8 @@ class DownloadWorker(QThread):
                                 download_success = True
                                 self.log.emit(f"  [INFO] Download completed from mirror network domain: {domain}")
                                 break
-                    except: pass
-                    if os.path.exists(osz_path): os.remove(osz_path)
+                    except:
+                        if os.path.exists(osz_path): os.remove(osz_path)
 
             if self._stop:
                 if os.path.exists(osz_path): os.remove(osz_path)
@@ -262,10 +278,13 @@ class MainWindow(QMainWindow):
         scan_btn = QPushButton("Index Target Folder")
         scan_btn.clicked.connect(self._scan_folder)
         self.scan_status = QLabel("Status: Unindexed")
+        open_index_btn = QPushButton("Open indexed_beatmaps.txt")
+        open_index_btn.clicked.connect(self._open_indexed_file)
         opt_lay.addWidget(self.no_video_cb)
         opt_lay.addWidget(self.skip_existing_cb)
         opt_lay.addWidget(scan_btn)
         opt_lay.addWidget(self.scan_status)
+        opt_lay.addWidget(open_index_btn)
         opt_lay.addStretch()
         t1_layout.addWidget(opt_group)
 
@@ -339,7 +358,7 @@ class MainWindow(QMainWindow):
         self.id_input.setPlainText(self.config.get("inputted_ids", ""))
         self.no_video_cb.setChecked(self.config.get("no_video", False))
         self.skip_existing_cb.setChecked(self.config.get("skip_existing", True))
-        self.existing_ids = set(str(i) for i in self.config.get("scanned_ids", []))
+        self.existing_ids = load_indexed_ids()
         if self.existing_ids: self.scan_status.setText(f"Status: {len(self.existing_ids)} Indexed")
         self.tab3_widget.load_saved_path()
 
@@ -350,8 +369,9 @@ class MainWindow(QMainWindow):
         self.config["inputted_ids"] = self.id_input.toPlainText()
         self.config["no_video"] = self.no_video_cb.isChecked()
         self.config["skip_existing"] = self.skip_existing_cb.isChecked()
-        self.config["scanned_ids"] = sorted(list(self.existing_ids))
+        self.config.pop("scanned_ids", None)  # no longer stored in config
         save_config(self.config)
+        save_indexed_ids(self.existing_ids)
 
     def _browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Songs Directory Target Location")
@@ -373,7 +393,42 @@ class MainWindow(QMainWindow):
         if not folder or not os.path.isdir(folder): return
         self.scan_status.setText("Status: Scanning...")
         self._scan_worker = ScanWorker(folder)
+        self._scan_worker.log.connect(self._log)
         self._scan_worker.done.connect(lambda ids: (setattr(self, 'existing_ids', ids), self.scan_status.setText(f"Status: {len(ids)} Indexed"), self._save_settings()))
+        self._scan_worker.start()
+
+    def _open_indexed_file(self):
+        import subprocess, platform
+        if not os.path.exists(INDEXED_IDS_FILE):
+            self._log("[WARN] indexed_beatmaps.txt does not exist yet — run Index Target Folder first.")
+            return
+        try:
+            if platform.system() == "Windows":
+                os.startfile(INDEXED_IDS_FILE)
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", INDEXED_IDS_FILE])
+            else:
+                subprocess.Popen(["xdg-open", INDEXED_IDS_FILE])
+        except Exception as e:
+            self._log(f"[ERROR] Could not open indexed_beatmaps.txt: {e}")
+
+    def _scan_folder(self):
+        folder = self.folder_input.text().strip()
+        if not folder or not os.path.isdir(folder): return
+        self.scan_status.setText("Status: Scanning...")
+        self._scan_worker = ScanWorker(folder)
+        self._scan_worker.log.connect(self._log)
+        
+        def on_scan_complete(ids):
+            self.existing_ids = ids
+            self.scan_status.setText(f"Status: {len(ids)} Indexed")
+            self._save_settings()
+            
+            if ids:
+                self.id_input.setPlainText("\n".join(sorted(list(ids), key=lambda x: int(x))))
+                self._log(f"[SUCCESS] Auto-loaded {len(ids)} indexed IDs into the download queue display matrix.")
+
+        self._scan_worker.done.connect(on_scan_complete)
         self._scan_worker.start()
 
     def _start_download(self):
@@ -383,6 +438,9 @@ class MainWindow(QMainWindow):
 
         ids = [m.group(1) for line in raw_ids.splitlines() if (m := re.match(r'^(\d+)', line.strip()))]
         if not ids: return
+
+        if self.skip_existing_cb.isChecked() and not self.existing_ids:
+            self._log("[WARN] 'Skip Existing' is enabled, but no local cache database index was loaded. Downloader might pull duplicate elements.")
 
         self._save_settings()
         self.download_btn.setEnabled(False)
@@ -404,8 +462,9 @@ class MainWindow(QMainWindow):
     def _on_download_finished(self):
         self.download_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        if self.worker and (self.worker._stop or self.progress_bar.value() == 0):
-            self.progress_bar.setFormat("Waiting...")
+        was_stopped = self.worker._stop if self.worker else False
+        if was_stopped or self.progress_bar.value() == 0:
+            self.progress_bar.setFormat("Stopped")
             self.progress_bar.setValue(0)
         else:
             self.progress_bar.setValue(self.progress_bar.maximum())
